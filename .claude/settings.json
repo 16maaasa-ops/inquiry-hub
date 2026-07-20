@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run test:classification)",
+      "Bash(npm run lint)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(vercel whoami)",
+      "Bash(vercel env ls:*)",
+      "Bash(vercel project ls:*)",
+      "Bash(vercel ls:*)",
+      "Bash(vercel inspect:*)",
+      "Bash(vercel logs:*)"
+    ]
+  }
+}

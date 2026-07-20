@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #0f172a;
+
+  /* 信頼感重視のビジネス系（白ベース + ネイビー/ブルー）。
+     ネイビー=構造（見出し・背景）、ブルー=行動（ボタン・リンク、Tailwind標準色を使用）、
+     赤=クレームのみに使う。ダークモード対応は行わない（固定で白ベース）。 */
+  --color-navy-50: #f5f7fa;
+  --color-navy-100: #e6ebf2;
+  --color-navy-200: #c8d3e3;
+  --color-navy-500: #3b5f9e;
+  --color-navy-700: #1e3a68;
+  --color-navy-800: #16294a;
+  --color-navy-900: #0f1e38;
+
+  /* lib/slack.ts の attachmentColor と同値。プレビューの再現度を保つため揃えている */
+  --color-alert: #e01e5a;
+  --color-alert-bg: #fef2f4;
+}
+
+/* Tailwind v4 は @theme で登録した --color-* だけがユーティリティクラス（bg-navy-900 等）を
+   生成する。:root に定義しただけでは反映されないため、ここで再マッピングする。 */
+@theme inline {
+  --color-navy-50: var(--color-navy-50);
+  --color-navy-100: var(--color-navy-100);
+  --color-navy-200: var(--color-navy-200);
+  --color-navy-500: var(--color-navy-500);
+  --color-navy-700: var(--color-navy-700);
+  --color-navy-800: var(--color-navy-800);
+  --color-navy-900: var(--color-navy-900);
+  --color-alert: var(--color-alert);
+  --color-alert-bg: var(--color-alert-bg);
+}
+
+html {
+  height: 100%;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  min-height: 100%;
+  color: var(--foreground);
+  background: var(--background);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", Meiryo,
+    sans-serif;
+  line-height: 1.8;
+  letter-spacing: 0.02em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
