@@ -90,6 +90,18 @@ function truncateBody(
   return { shown: body.slice(0, maxLength), truncated: true };
 }
 
+// 問い合わせ本文・送信者名など「外部から届く文字列」をSlackに載せる前に無害化する。
+// Slackのmrkdwnでは <!channel> や <@Uxxxx> がチャンネル全員／特定個人への通知として
+// 解釈されるため、エスケープしないと「本文に <!channel> と書くだけで全員に通知が飛ぶ」
+// スパムの踏み台になる。Slack公式の推奨どおり & < > の3文字だけを実体参照に置換する
+// （順序が重要：& を最初に置換しないと後段の &lt; などが二重エスケープされる）。
+function escapeSlackText(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function statusText(inquiry: Inquiry): string {
   if (inquiry.resolved_at)
     return `${STATUS_EMOJI.resolved}（${inquiry.assigned_to ?? "担当者不明"}）`;
@@ -133,7 +145,10 @@ function buildCardContent(inquiry: Inquiry): BuildCardResult {
       type: "section",
       fields: [
         { type: "mrkdwn", text: `*経路:*\n${channelLabel(inquiry.channel)}` },
-        { type: "mrkdwn", text: `*送信者:*\n${senderLabel(inquiry)}` },
+        {
+          type: "mrkdwn",
+          text: `*送信者:*\n${escapeSlackText(senderLabel(inquiry))}`,
+        },
         {
           type: "mrkdwn",
           text: `*受信:*\n${slackDateToken(inquiry.received_at)}`,
@@ -145,8 +160,8 @@ function buildCardContent(inquiry: Inquiry): BuildCardResult {
       text: {
         type: "mrkdwn",
         text: truncated
-          ? `${shown}\n_…（続きあり。スレッドに全文を投稿）_`
-          : shown,
+          ? `${escapeSlackText(shown)}\n_…（続きあり。スレッドに全文を投稿）_`
+          : escapeSlackText(shown),
       },
     },
     {
@@ -243,7 +258,7 @@ export async function postInquiryCard(
     await slackApiCall("chat.postMessage", {
       channel: channelId,
       thread_ts: result.ts,
-      text: inquiry.body,
+      text: escapeSlackText(inquiry.body),
     });
   }
 
