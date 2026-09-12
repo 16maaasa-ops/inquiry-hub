@@ -1,12 +1,19 @@
 # 引き継ぎ書（project5: 問い合わせ集約 + AI分類システム）
 
-作成日: 2026-07-16 / 最終更新: 2026-07-20。このファイルを新しい会話の最初に読んでもらえば、続きから作業できます。
+作成日: 2026-07-16 / 最終更新: 2026-07-25。このファイルを新しい会話の最初に読んでもらえば、続きから作業できます。
 
-## 現在地（2026-07-20 時点）
+## 現在地（2026-07-25 時点）
 
 **本番稼働中・Cronも稼働中**: https://project5-three-weld.vercel.app
 
 デモ画面・バックエンド（Slack・LINE）・Cronによる自動実行、すべて本番でend-to-end稼働確認済み。
+**このプロジェクトは実装・インフラ面では完成している。** README も仕上げ済み（`README.md`）。
+
+2026-07-25 に再確認したこと（コミット済みコードに変更なし＝同一内容の再デプロイのみ実施）：
+
+- 公開URL: トップ `200` / `/api/demo/classify` `200`（「内見」を正しく判定）/ `/api/cron/process` 認証なしで `401`（正しく保護）
+- Vercelの環境変数一式（Anthropic/Supabase/Slack/LINE/Cron）はすべて設定済みであることを `vercel env ls` で確認
+- Supabase相乗り（project4との共存）も正常
 
 ### Cronは Vercel純正ではなく cron-job.org（外部無料サービス）で1分毎に実行
 
@@ -48,6 +55,42 @@ Value欄に `Bearer ` プレフィックスが付かず値だけ（例: `masaooo
 （Vercel側の設定確認）と「cron-job.orgのHistory/DETAILSで実際に送られた値を見る」
 （送信側の設定確認）の両方が有効だった。
 
+### Cron失敗メール対策（2026-09-12）
+
+cron-job.orgから`project5-cron-process`の失敗メール（500）が繰り返し届く問題を調査・修正した。
+`npx vercel logs`で実測した原因は、コードのバグではなく**Supabase無料プランの一時的な
+Gateway Timeout**（直近22分で23回中4回、約17%）。1分毎の実行で成功と失敗が交互に起きるたびに
+cron-job.orgの通知がリセット→再送されるため、数分おきにメールが飛び続けていた。
+
+**対処（実装済み）**：
+
+- `lib/retry.ts`（新規）：`isTransientDbError`（HTTPステータス/PostgreSQLエラーコード基準で
+  一時的か恒久的かを判定。判定できないものは恒久＝500に倒す）と`withRetry`（一時的エラーのみ
+  その場で再試行。デッドライン15秒）
+- `lib/supabase.ts`：fetchに8秒タイムアウトを追加。これが無いと`withRetry`が
+  `maxDuration=60`を使い切り、Vercel自身が504を返してメールが結局止まらない
+- `app/api/cron/process/route.ts`：キュー取得が一時的エラーで再試行後も解決しなければ、
+  500ではなく200（`status:"skipped_run"`）を返す。恒久的な異常は従来どおり500のまま
+- `supabase/schema.sql`：固着行の救済しきい値を**5分→90秒**に短縮
+  （`maxDuration=60`なので、処理中の行が60秒を超えて`processing`のままなのは原理的に無い。
+  以前の5分だと、claimの応答だけタイムアウトした行が5分間放置され、受信から6分超で
+  LINE通知が飛び5分SLAを破りうる穴があった）
+- `app/api/cron/daily-summary/route.ts`：受信件数だけでは「土日で問い合わせが無い」のと
+  「ワーカーが止まって溜まっている」を区別できないため、「未処理(pending/processing)が
+  何件・最古はいつからか」を追加。集計自体がエラーで失敗した場合も明示して投稿する
+
+**★重要（引き継ぐ人へ）**：cron-job.orgに登録されているジョブは`process`の1本だけで、
+`daily-summary`（毎朝1回、#system-alertsへ投稿）はコードは完成しているが**cron-job.org側で
+まだ登録していない可能性がある**（このHANDOFFにこれまで登録の記録が無かったため）。
+上記の「一時的エラーは200で静かにする」対処は、この日次サマリが実際に動いていることが
+前提になっている。**必ずcron-job.orgの管理画面で登録状況を確認し、無ければ追加すること**
+（`https://project5-three-weld.vercel.app/api/cron/daily-summary`を1日1回、
+`Authorization: Bearer <CRON_SECRET>`付きでGET。コード変更は不要）。
+
+**5分SLAは「cron-job.orgの実行間隔1分」と「救済しきい値90秒」の2つがセットで支えている。**
+片方だけを動かすとSLAが崩れるため、変更する場合は両方を見直すこと
+（間隔を緩めると失敗行の再処理が遅れる、しきい値を伸ばすと救済までの遅延がSLAを超える）。
+
 ## 完了：Slack・LINE本番接続と実機検証（2026-07-20）
 
 **5分SLA・冪等性を含め、システム全体を実機で検証済み。**
@@ -73,8 +116,10 @@ Value欄に `Bearer ` プレフィックスが付かず値だけ（例: `masaooo
   「放置すると壊れる」リスクが最も高い。コードは残し、READMEに「認証情報を入れれば動く」と明記する。
 - **LINE + Slack のみ本番接続する**。これだけで見せ場（受信→AI分類→Slack振り分け→クレーム検知→
   部長へLINE Push）と、課題の要求（署名検証・冪等性・5分SLA）は全て満たせる。
-- **測定したら Cron は止める**。ポートフォリオとして常時稼働させると、トークン失効や無料枠切れで
-  «壊れたサイト» になるリスクがあるため。5分SLAを実測してスクショを撮ったら `crons: []` に戻す。
+- ~~**測定したら Cron は止める**~~ → **2026-07-20 に方針変更・撤回。常時稼働させたままにする**。
+  当初は「常時稼働させるとトークン失効や無料枠切れで «壊れたサイト» になる」と考えていたが、
+  Cronを cron-job.org（無料・保守不要）に委譲し、失効の時限爆弾がある Gmail をスコープ外にしたことで、
+  停止する理由がなくなった。「実際に動いているシステム」を常に見せられる状態を優先する（冒頭「現在地」参照）。
 
 ## プロジェクト概要
 
@@ -117,59 +162,52 @@ project1・project4と同じSupabaseプロジェクト（`mock-project-1`）へ�
 - 本番ドメイン（安定・Webhook登録用）: `https://project5-three-weld.vercel.app`
 - `ANTHROPIC_API_KEY` 設定済み（Production + Preview、Sensitive ON）
 - 動作確認済み: `/` → 200、`/api/demo/classify` → 200（クレーム/緊急を正しく判定）、
-  `/api/cron/process` → 401（環境変数未設定のため正しく拒否）
+  `/api/cron/process` → 認証ヘッダーなしのアクセスは 401（`CRON_SECRET`で正しく保護。cron-job.orgは正しいヘッダーを付けて200を得ている）
 - Vercel CLI インストール済み（`vercel whoami` → `16maaasa-ops`、
   プロジェクト `yuki-taniguchi-s-projects/project5`）
 
-## 残っていること（優先順）
+## 残っていること
 
-1. **Slack設定**：Botトークン・Signing Secret、5チャネル（賃貸/売買/内見/クレーム/その他）+
-   `#system-alerts`、Interactivity URL登録（`https://project5-three-weld.vercel.app/api/webhooks/slack`）
-2. **LINE設定**：Messaging APIチャネル、Webhook URL
-   （`https://project5-three-weld.vercel.app/api/webhooks/line`）、営業部長のユーザーID取得
-3. **Vercelに環境変数を追加**（下記「必要な環境変数」参照）。値はダッシュボードで直接入力する
-   （秘密情報を会話に貼らない方針のため）
-4. `vercel.json` の crons を復元（**Gmailは除外して2本**）→ 再デプロイ
-5. **クレーム文面を実送信 → 5分以内にLINE Pushが届くか測定 → スクショ**
-6. **crons を `[]` に戻して停止**
-7. README仕上げ（構成図・運用マニュアル・キーローテーション手順・測定結果・精度22/22）
-8. `git init` → GitHubへ（**まだGitリポジトリではない**）
-9. 発注元企業への確認：問い合わせ本文がSupabase/Slack/Anthropicに渡ることの同意
+**コードは実装済みだが、以下2つの手作業がデプロイ後に必須**（上記「Cron失敗メール対策」参照）：
 
-### 必要な環境変数（コードから抽出した確定リスト）
+1. **Supabase SQL Editorで `supabase/schema.sql` の `reclaim_stuck_inquiries` を再実行**：
+   救済しきい値を5分→90秒に変更したが、`create or replace function`は自動では反映されない。
+   デプロイ前にSQL Editorで実行しておくこと（さもないと救済が5分のままでSLAの穴が残る）。
+2. **cron-job.orgで`daily-summary`ジョブの登録有無を確認・無ければ追加**：
+   `https://project5-three-weld.vercel.app/api/cron/daily-summary`を1日1回、
+   `Authorization: Bearer <CRON_SECRET>`付きでGET。今回の「一時的エラーは200で静かにする」
+   対処は、この日次サマリが実際に動いていることが前提（コード変更は不要）。
 
-Vercelに未設定のもの。`ANTHROPIC_API_KEY`のみ設定済み。
+以下は任意／対外的な項目。
 
-| 変数                                                                                  | 取得元                                                                   |
-| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `NEXT_PUBLIC_SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`                              | `.env.local`と同じ値（project1/4と共通）                                 |
-| `CRON_SECRET`                                                                         | 任意の文字列。VercelがCron実行時に`Authorization: Bearer <値>`で自動送信 |
-| `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN`                                   | LINE Developers → Messaging APIチャネル                                  |
-| `LINE_MANAGER_USER_ID`                                                                | 部長役アカウントで友だち追加 → Webhookに届く`source.userId`              |
-| `SLACK_BOT_TOKEN` (`xoxb-`) / `SLACK_SIGNING_SECRET`                                  | Slack App設定                                                            |
-| `SLACK_CHANNEL_RENTAL` / `SALE` / `VIEWING` / `COMPLAINT` / `OTHER` / `SYSTEM_ALERTS` | チャネル**ID**（`C01234ABCD`形式。名前ではない）                         |
-| ~~`GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN`~~                 | **スコープ外**（上記「スコープの決定」参照）                             |
+1. **発注元企業への確認（模擬案件のため実施は任意）**：問い合わせ本文が Supabase / Slack / Anthropic の
+   各サービスへ送信されることへの同意。実運用に移す場合のみ必要。
+2. **Gmail連携を有効化する場合のみ**（現状スコープ外）：`GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` /
+   `GMAIL_REFRESH_TOKEN` を Vercel に設定し、OAuth同意画面を「本番」ステータスに公開する
+   （テスト状態だと7日でトークン失効。詳細は上記「スコープの決定」）。
 
-## vercel.json の crons を空にしている【測定時のみ復元 → その後また空に戻す】
+### 環境変数（すべて Vercel に設定済み・2026-07-25 に `vercel env ls` で確認）
 
-2026-07-17、初回デプロイにあたり Slack/LINE 未設定のため毎分エラーが出るのを避ける目的で
-`vercel.json` を `{"crons": []}` にした。
+以下は Production + Preview に設定済み。**新規に登録する作業は残っていない。**
 
-**5分SLAの測定をするときだけ**、以下に戻して再デプロイする（**Gmailはスコープ外なので `poll-gmail` は入れない**）：
+- AI: `ANTHROPIC_API_KEY`
+- Supabase: `NEXT_PUBLIC_SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`（project1/4と共通の値）
+- Cron: `CRON_SECRET`（cron-job.org が `Authorization: Bearer <値>` で送信）
+- LINE: `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_MANAGER_USER_ID`
+- Slack: `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` /
+  `SLACK_CHANNEL_{RENTAL,SALE,VIEWING,COMPLAINT,OTHER,SYSTEM_ALERTS}`（値はチャネル**ID**）
+- Gmail（`GMAIL_*`）のみ**スコープ外で未設定**
 
-```json
-{
-  "crons": [
-    { "path": "/api/cron/process", "schedule": "* * * * *" },
-    { "path": "/api/cron/daily-summary", "schedule": "0 22 * * *" }
-  ]
-}
-```
+値の入力はダッシュボードで直接行う方針（秘密情報を会話に貼らないため）。
+変更後は**再デプロイして初めて反映される**点に注意（追加・変更だけでは本番に反映されない）。
 
-**測定してスクショを撮ったら、`{"crons": []}` に戻して再デプロイすること。**
-ポートフォリオとして常時稼働させると、無料枠切れやトークン失効で «壊れたサイト» になるため
-（「スコープの決定」参照）。READMEには「Cronは検証後に停止している。復元するにはvercel.jsonを戻すだけ」
-と明記する。
+## vercel.json の crons は恒久的に `{"crons": []}`【復元しないこと】
+
+Vercel 無料プラン（Hobby）は1日1回のCronしか許可せず、1分毎（`* * * * *`）はデプロイ時点で
+拒否される（`Hobby accounts are limited to daily cron jobs`）。そのためスケジューリングは
+**cron-job.org（外部無料サービス）に完全委譲**しており、`vercel.json` は空のままが正しい状態。
+Vercel純正Cronを復元するとデプロイが失敗する。運用を止めたいときは cron-job.org 側でジョブを
+無効化すればよく、Vercel側の変更は不要（詳細は冒頭「現在地」節）。
 
 ## 覚えておいてほしい運用ルール（このセッション中にユーザーから指示済み）
 

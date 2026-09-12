@@ -22,6 +22,7 @@ Claude API が「賃貸・売買・内見・クレーム・その他」の5分�
 | 分類精度                    | 22/22件（`data/case5-test-inquiries.csv`、`npm run test:classification`で再現可） |
 | クレーム→LINE Push 所要時間 | 約14秒（要件は5分以内）                                                           |
 | 冪等性                      | リトライ時にSlack再投稿が発生しないことを実機で確認済み                           |
+| Cron成功率                  | 約83%（無料DBの一時的なGateway Timeoutを23回中4回で実測。詳細は次節）             |
 
 分類精度テストは「クレームを見逃さない」「無関係な雑談をクレーム誤判定しない」
 「『緊急ではありません』という文言に釣られない」といった、正答率だけでは測れない
@@ -52,6 +53,21 @@ Vercel の無料プラン（Hobby）は1日1回のCronしか許可しておら�
 （[cron-job.org](https://cron-job.org)）から`CRON_SECRET`付きで1分毎に叩く構成にしました。
 Vercel側の`vercel.json`は`{"crons": []}`のままで、スケジューリングは完全に外部サービスに委ねています。
 
+### 無料プランのDBが時々タイムアウトする前提での設計
+
+Supabase無料プランは、時々応答が長引き`Gateway Timeout`を返すことを実測しています
+（`npx vercel logs`で直近22分に23回中4回、約17%）。この前提を踏まえ、「HTTPの成功/失敗」と
+「業務上の異常」を分けて設計しています。
+
+- 一時的なDB不調（`lib/retry.ts`の`isTransientDbError`が判定）はその場で数回リトライした上で、
+  それでも解決しなければ200を返して「今回はスキップ、1分後の次回実行で再処理」とする
+  （500を返すとcron-job.orgから失敗通知メールが数分おきに飛び続けてしまうため）
+- 設定ミス・キー失効などの恒久的な異常は従来どおり500を返し、気づけるようにする
+- 通知を静かにした代わりに、`app/api/cron/daily-summary/route.ts`（毎朝1回、#system-alertsへ投稿）で
+  「未処理（pending/processing）が何件・最古はいつからか」を見えるようにしている。
+  受信件数だけだと「土日で問い合わせが無い」のと「ワーカーが止まって溜まっている」を
+  区別できないため、滞留の有無を別枠で出している
+
 ### スコープ外にしたもの
 
 Gmail連携は実装済みですが（`lib/gmail.ts`、`app/api/cron/poll-gmail/route.ts`）、本番では未接続です。
@@ -68,21 +84,36 @@ Gmail連携は実装済みですが（`lib/gmail.ts`、`app/api/cron/poll-gmail/
 
 ### 障害だと感じたら
 
-1. [Vercel Dashboard](https://vercel.com) の Functions ログでエラーを確認
-2. Supabase の `project5.inquiries` テーブルで `status = 'failed'` の行を確認
-   （5回リトライしても解決しなかった問い合わせです）
-3. [cron-job.org](https://cron-job.org) のジョブ実行履歴で、直近の実行が失敗し続けていないか確認
-4. 5分以上Slackに新着が来ない場合は開発担当へ連絡
+1. Supabaseで未処理（`pending`/`processing`）の滞留を確認する（下記SQL）。
+   一時的なDB不調は自動で200を返して次回実行に委ねる設計のため、Vercelログや
+   cron-job.orgの実行履歴は「異常なし」に見えても、滞留があれば実際には詰まっています
+2. [Vercel Dashboard](https://vercel.com) の Functions ログで `SKIP_DB_TIMEOUT` を検索する。
+   出ていても自動回復する想定のため、上記1で滞留が無ければ様子見でよい
+3. Supabase の `project5.inquiries` テーブルで `status = 'failed'` の行を確認
+   （一時的なDB不調が30分以上続いた、または5回リトライしても解決しなかった問い合わせです。
+   `failed`になった行は自動で再処理されないため、原因を確認した上で手動で`pending`に戻す）
+4. [cron-job.org](https://cron-job.org) のジョブ実行履歴で、直近の実行が失敗し続けていないか確認
+   （401や恒久的な設定ミスは今回の変更後も500のままなので、ここで気づけます）
+5. 5分以上Slackに新着が来ない場合は開発担当へ連絡
 
 ### 監視（コストをかけない方法）
 
-専用の監視ツールは使わず、Supabaseで直近24時間の状況を1本のSQLで確認します。
+専用の監視ツールは使わず、Supabaseで直近24時間の状況と、今この瞬間の滞留を2本のSQLで確認します。
 
 ```sql
+-- 直近24時間のステータス別件数
 select status, count(*) from project5.inquiries
 where created_at > now() - interval '24 hours'
 group by status;
+
+-- 今この瞬間の滞留（最古の未処理がいつからか）。日次サマリの「最古の未処理」と同じ集計
+select count(*) as pending_count, min(received_at) as oldest_received_at
+from project5.inquiries
+where status in ('pending', 'processing');
 ```
+
+毎朝の日次サマリ（#system-alerts、`app/api/cron/daily-summary/route.ts`）にも同じ「最古の未処理」が
+載るので、電話で問い合わせを受けたときはSlackとこのSQLの結果を見比べれば会話が成立します。
 
 ## APIキーローテーション手順
 

@@ -311,11 +311,22 @@ export async function getPermalink(
 }
 
 // システム系アラート（処理失敗・日次サマリ）を専用チャネルへ投稿
+//
+// 戻り値のokを確認しないと、アラート自体が届かなかったこと（チャネル削除・
+// トークン失効等）に誰も気づけない。「監視の監視が無い」状態を避けるため、
+// 失敗時は最低限Vercelログに残す（呼び出し側でさらに .catch(() => {}) しても
+// ここでのログ出力までは消えない）。
 export async function postSystemAlert(text: string): Promise<void> {
-  await slackApiCall("chat.postMessage", {
+  const result = await slackApiCall("chat.postMessage", {
     channel: systemAlertsChannelId(),
     text,
   });
+  if (!result.ok) {
+    console.error(
+      `システムアラートの投稿に失敗しました（Slack API error: ${result.error ?? "unknown"}）:`,
+      text,
+    );
+  }
 }
 
 // 誰がボタンを押したかを ephemeral（本人だけに見える）メッセージで伝える
