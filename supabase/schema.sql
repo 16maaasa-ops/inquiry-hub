@@ -46,7 +46,7 @@ create table if not exists project5.inquiries (
   -- キュー制御（二重処理防止・固着行の救済に使用）
   status text not null default 'pending', -- pending / processing / done / failed / skipped
   retry_count int not null default 0,
-  processing_started_at timestamptz,      -- processing になった時刻。5分超で救済対象
+  processing_started_at timestamptz,      -- processing になった時刻。90秒超で救済対象
   processed_at timestamptz,               -- done になった時刻（5分SLAの実測に使用）
 
   -- 冪等性（ステップ単位でのリトライ時に二重通知を防ぐ）
@@ -106,8 +106,16 @@ end;
 $$;
 
 -- ============================================================
--- 固着行の救済：processing のまま5分以上経過した行を pending に戻す。
+-- 固着行の救済：processing のまま90秒以上経過した行を pending に戻す。
 -- サーバー落ち・タイムアウトで宙に浮いた問い合わせを取りこぼさないための仕組み。
+--
+-- 【しきい値90秒の根拠】Vercel Functions の maxDuration=60秒（app/api/cron/process/route.ts）
+-- なので、正当に処理中の行が60秒を超えて processing のままでいることは原理的に無い。
+-- 90秒を超えていれば確実に「死んだ行」（claim自体はDB側で成功したがレスポンスが
+-- タイムアウトした等）。この90秒と、cron-job.orgの実行間隔1分の2つがセットで
+-- 「クレームは5分以内にLINE通知」というSLA（README.md）を支えているため、
+-- どちらか一方だけを変更しないこと（HANDOFF.md参照）。
+-- 以前は5分だったが、それだと救済までの最大遅延がSLAそのものを超えてしまうため短縮した。
 -- ============================================================
 create or replace function project5.reclaim_stuck_inquiries()
 returns int
@@ -122,7 +130,7 @@ begin
     set status = 'pending',
         processing_started_at = null
     where status = 'processing'
-      and processing_started_at < now() - interval '5 minutes'
+      and processing_started_at < now() - interval '90 seconds'
     returning id
   )
   select count(*) into reclaimed_count from reclaimed;

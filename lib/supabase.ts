@@ -37,6 +37,19 @@ function getClient(): Project5Client {
   client = createClient<any, "project5">(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false },
     db: { schema: "project5" },
+    global: {
+      // 1回の通信を8秒で見切りをつける。Supabase無料プランは時々応答が長引く
+      // （Gateway Timeout）ため、これが無いと lib/retry.ts の withRetry がいつまでも
+      // 応答を待ち続け、Vercel Functions の maxDuration(60秒) を超えて504になってしまう
+      // （504だとcron-job.orgからの失敗メールが結局止まらない）。
+      // 打ち切られた場合、postgrest-js は例外を投げず { error, status: 0 } に変換して
+      // 返すので、呼び出し側の判定（lib/retry.ts の isTransientDbError）で拾える。
+      fetch: (input, init) =>
+        fetch(input, {
+          ...init,
+          signal: init?.signal ?? AbortSignal.timeout(8000),
+        }),
+    },
   });
   return client;
 }

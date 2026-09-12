@@ -26,6 +26,7 @@ import {
   updateInquirySlackInfo,
   markLineNotified,
 } from "@/lib/inquiries";
+import { DbError, isTransientDbError, withRetry } from "@/lib/retry";
 import type { Inquiry } from "@/lib/types";
 
 export const maxDuration = 60;
@@ -76,9 +77,39 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const claimed = await claimPendingInquiries(10);
+  let claimed: Inquiry[];
+  try {
+    // Supabase無料プランは時々応答が長引く（Gateway Timeout）。POSTのRPCは
+    // ライブラリ内部でリトライされないため、ここだけ自前でその場再試行する
+    claimed = await withRetry(() => claimPendingInquiries(10));
+  } catch (error) {
+    if (isTransientDbError(error)) {
+      // 一時的なDB不調で、再試行しても解決しなかった。1分後の次回実行で
+      // 処理されるので今回は正常終了として扱う（500を返すと外部Cronサービスから
+      // 失敗通知メールが飛び続けてしまうため）。SKIP_DB_TIMEOUT はログ検索用タグ。
+      const message = error instanceof Error ? error.message : String(error);
+      const status = error instanceof DbError ? error.status : undefined;
+      const code = error instanceof DbError ? error.code : undefined;
+      console.warn(
+        `SKIP_DB_TIMEOUT [cron/process] キュー取得が再試行後もタイムアウト。` +
+          `1分後の次回実行で再処理されます。status=${status} code=${code} message=${message}`,
+      );
+      return NextResponse.json({
+        ok: true,
+        status: "skipped_run",
+        reason: "db_timeout",
+        claimed: 0,
+        doneCount: 0,
+        retriedCount: 0,
+        failedCount: 0,
+        message: "Supabaseの応答が遅く再試行も失敗。次回(1分後)に再処理します",
+      });
+    }
+    throw error; // 恒久的な異常は500のまま（気づけるようにする）
+  }
 
   let doneCount = 0;
+  let retriedCount = 0;
   let failedCount = 0;
 
   for (const inquiry of claimed) {
@@ -87,11 +118,21 @@ export async function GET(request: NextRequest) {
       doneCount += 1;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const { willRetry } = await markInquiryFailedOrRetry(inquiry);
-      if (!willRetry) {
+      const isTransient = isTransientDbError(error);
+      const { willRetry } = await markInquiryFailedOrRetry(inquiry, {
+        isTransient,
+      });
+      if (willRetry) {
+        retriedCount += 1;
+      } else {
         failedCount += 1;
+        // 一時的なDB不調が原因で失敗上限に達した場合は文面を分ける。
+        // 「エラー: Gateway Timeout」とだけ出すと読んだ人がコードのバグだと誤読するため。
+        const reasonText = isTransient
+          ? "Supabaseの一時的な不調が30分以上続いたため処理できませんでした"
+          : `エラー: ${message}`;
         await postSystemAlert(
-          `🔴 問い合わせ処理が失敗上限に達しました（id: ${inquiry.id}）\n本文冒頭: ${inquiry.body.slice(0, 50)}\nエラー: ${message}`,
+          `🔴 問い合わせ処理が失敗上限に達しました（id: ${inquiry.id}）\n本文冒頭: ${inquiry.body.slice(0, 50)}\n${reasonText}`,
         ).catch(() => {});
       }
     }
@@ -99,8 +140,10 @@ export async function GET(request: NextRequest) {
 
   return NextResponse.json({
     ok: true,
+    status: "processed",
     claimed: claimed.length,
     doneCount,
+    retriedCount,
     failedCount,
   });
 }
